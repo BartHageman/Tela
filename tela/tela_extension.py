@@ -21,8 +21,10 @@
 import zipfile
 # Krita Module
 from krita import *
-# PyQt5 Modules
-from PyQt5 import QtWidgets, QtCore, QtGui, uic
+# PyQt6 Modules
+from PyQt6 import QtWidgets, QtCore, QtGui, uic
+from PyQt6.QtWidgets import QAbstractScrollArea
+from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 # Project Pages Modules
 from .tela_modulo import (
     MirrorFix_Button,
@@ -56,7 +58,7 @@ class Tela_Extension( Extension ):
         # Operating System
         self.OS = str( QSysInfo.kernelType() ) # WINDOWS=winnt & LINUX=linux
         if self.OS == 'winnt': # Unlocks icons in Krita for Menu Mode
-            QApplication.setAttribute( Qt.AA_DontShowIconsInMenus, False )
+            QApplication.setAttribute( Qt.ApplicationAttribute.AA_DontShowIconsInMenus, False )
         # Path Name
         self.directory_plugin = str( os.path.dirname( os.path.realpath( __file__ ) ) )
         # Color Picker
@@ -67,6 +69,7 @@ class Tela_Extension( Extension ):
         self.qmenu = None
         self.stacked_widget = None
         self.qmdiarea = None
+        self.canvas_widget = None
         self.window_list = list()
 
         # Variables
@@ -486,14 +489,20 @@ class Tela_Extension( Extension ):
         # Main Window
         self.stacked_widget = self.window.qwindow().centralWidget()
         self.qmdiarea = self.stacked_widget.findChild( QMdiArea )
-        self.qmdiarea.installEventFilter( self )
 
-        # Display
-        self.Interface_Create( self.qmdiarea )
-        self.Tela_Geometry( self.show_option, self.show_extra, self.hide_tela )
+        # Display — overlays are created with no parent for now; Canvas_Changed
+        # attaches them to the active document's canvas widget. In Krita 6 the
+        # canvas (QOpenGLWidget) is a native OS window that captures clicks
+        # for its region, so the overlays MUST be its children (not siblings)
+        # to receive mouse events.
+        self.Interface_Create( None )
         # Color Picker
-        self.color_picker.setParent( self.qmdiarea )
         self.color_picker.hide()
+
+        # Reparent overlays onto the active subwindow's canvas, and swap them
+        # over whenever the user switches documents.
+        self.qmdiarea.subWindowActivated.connect( self.Canvas_Changed )
+        self.Canvas_Changed( self.qmdiarea.activeSubWindow() )
         # Progress Bar
         self.krita_progress_bar = self.window.qwindow().statusBar().findChild( QProgressBar )
         self.krita_progress_bar.valueChanged.connect( self.Progress_Bar )
@@ -895,10 +904,10 @@ class Tela_Extension( Extension ):
         qsize = QSize( pw, ph )
         # QWidget
         button.setObjectName( name )
-        button.setSizePolicy( QSizePolicy.Fixed, QSizePolicy.Fixed )
+        button.setSizePolicy( QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed )
         button.setMinimumSize( qsize )
         button.setMaximumSize( qsize )
-        button.setFocusPolicy( Qt.NoFocus )
+        button.setFocusPolicy( Qt.FocusPolicy.NoFocus )
         # QAbstract Button
         button.setText( "" )
         button.setCheckable( check )
@@ -910,10 +919,10 @@ class Tela_Extension( Extension ):
         qsize = QSize( pw, ph )
         # QWidget
         progress.setObjectName( name )
-        progress.setSizePolicy( QSizePolicy.Fixed, QSizePolicy.Fixed )
+        progress.setSizePolicy( QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed )
         progress.setMinimumSize( qsize )
         progress.setMaximumSize( qsize )
-        progress.setFocusPolicy( Qt.NoFocus )
+        progress.setFocusPolicy( Qt.FocusPolicy.NoFocus )
         # QProgress Bar
         progress.setMinimum( 0 )
         progress.setMaximum( 99 )
@@ -929,9 +938,58 @@ class Tela_Extension( Extension ):
         style_sheet += "QSlider::add-page:horizontal { background-color: " + page_add + "; }" # Right Side
         widget.setStyleSheet( style_sheet )
 
+    # Canvas attachment
+    def Overlay_Widgets( self ):
+        return [
+            self.menu_krita, self.menu_vector, self.menu_brush, self.menu_transform,
+            self.menu_color, self.menu_overlay, self.menu_select, self.menu_camera,
+            self.menu_break,
+            self.progress_bar,
+            self.menu_mirror_fix, self.menu_color_picker,
+            self.spt_free, self.spt_perspective, self.spt_warp,
+            self.spt_cage, self.spt_liquify, self.spt_mesh,
+            self.sps_invert, self.sps_all, self.sps_none,
+            self.menu_tela,
+            self.color_picker,
+            ]
+    def Canvas_Changed( self, sub ):
+        # Stop watching the previous canvas widget
+        if self.canvas_widget is not None:
+            self.canvas_widget.removeEventFilter( self )
+            self.canvas_widget = None
+
+        # No document open — detach overlays so they don't dangle
+        if sub is None:
+            for w in self.Overlay_Widgets():
+                w.setParent( None )
+                w.hide()
+            return
+
+        # Find the canvas widget inside this subwindow. Prefer QOpenGLWidget
+        # (the standard OpenGL canvas); fall back to the first QWidget child
+        # that contains the rendering area for the QPainter canvas path.
+        canvas = sub.findChild( QOpenGLWidget )
+        if canvas is None:
+            scroll = sub.findChild( QAbstractScrollArea )
+            canvas = scroll.viewport() if scroll is not None else sub
+        self.canvas_widget = canvas
+        self.canvas_widget.installEventFilter( self )
+
+        # Reparent every overlay onto the canvas. setParent() implicitly hides
+        # the widget, so we re-show after positioning.
+        for w in self.Overlay_Widgets():
+            w.setParent( self.canvas_widget )
+        self.color_picker.hide()
+        self.Tela_Geometry( self.show_option, self.show_extra, self.hide_tela )
+        for w in self.Overlay_Widgets():
+            if w is self.color_picker:
+                continue
+            w.show()
+            w.raise_()
+
     # Geometry
     def Size_Update( self ):
-        if self.qmdiarea != None:
+        if self.canvas_widget != None:
             # Size
             wcp = self.color_picker
             pw = wcp.width()
@@ -962,10 +1020,10 @@ class Tela_Extension( Extension ):
         self.hide_tela = hide_tela
 
         # Geormetry
-        if self.qmdiarea != None:
+        if self.canvas_widget != None:
             # Canvas
-            qmd_w = self.qmdiarea.width()
-            qmd_h = self.qmdiarea.height()
+            qmd_w = self.canvas_widget.width()
+            qmd_h = self.canvas_widget.height()
             # Levels
             l0 = 90
             l1 = 55
@@ -1031,13 +1089,13 @@ class Tela_Extension( Extension ):
             self.menu_tela.setGeometry(         int( qmd_w*0.5-wide*0.5 ),            int( qmd_h-self.pbc ), wide,      self.pba )
     # Picker Geometry
     def Picker_to_Cursor( self ):
-        if self.qmdiarea != None:
+        if self.canvas_widget != None:
             # Cursor
             position = QCursor().pos()
             cx = position.x()
             cy = position.y()
             # Canvas
-            delta = self.qmdiarea.mapFromGlobal( QPoint( 0, 0 ) )
+            delta = self.canvas_widget.mapFromGlobal( QPoint( 0, 0 ) )
             dx = delta.x()
             dy = delta.y()
             # Widget
@@ -1151,9 +1209,9 @@ class Tela_Extension( Extension ):
         size = 23  # 23 is the expected height of a self.qmenu item on windows at least
         height = size * item + self.my
         qpoint = widget.geometry().topLeft()
-        pos = self.qmdiarea.mapToGlobal( qpoint )
+        pos = self.canvas_widget.mapToGlobal( qpoint )
         point = QPoint( pos.x(), pos.y() - height )
-        action = self.qmenu.exec_( point )
+        action = self.qmenu.exec( point )
 
         # State
         if action == action_view_docker_ui:             self.View_Docker_UI()
@@ -1200,9 +1258,9 @@ class Tela_Extension( Extension ):
         size = 23  # 23 is the expected height of a self.qmenu item on windows at least
         height = size * item + self.my
         qpoint = widget.geometry().topLeft()
-        pos = self.qmdiarea.mapToGlobal( qpoint )
+        pos = self.canvas_widget.mapToGlobal( qpoint )
         point = QPoint( pos.x(), pos.y() - height )
-        action = self.qmenu.exec_( point )
+        action = self.qmenu.exec( point )
         # State
         if action == action_show_option:    self.Show_Option( not self.show_option )
         if action == action_show_extra:     self.Show_Extra( not self.show_extra )
@@ -1345,9 +1403,9 @@ class Tela_Extension( Extension ):
         size = 23  # 23 is the expected height of a self.qmenu item on windows at least
         height = size * len_key + self.my
         qpoint = widget.geometry().topLeft()
-        pos = self.qmdiarea.mapToGlobal( qpoint )
+        pos = self.canvas_widget.mapToGlobal( qpoint )
         point = QPoint( pos.x(), pos.y() - height )
-        action = self.qmenu.exec_( point )
+        action = self.qmenu.exec( point )
 
         # Pin
         if action in action_menu:
@@ -1483,7 +1541,7 @@ class Tela_Extension( Extension ):
         # QImage
         qimage_thumbnail = ad.thumbnail( adw, adh )
         qimage_selection = qimage_thumbnail.copy( int( px ), int( py ), int( pw ), int( ph ) )
-        mode = Qt.SmoothTransformation
+        mode = Qt.TransformationMode.SmoothTransformation
         if ( self.export_width_state == True and self.export_height_state == False ):
             qimage_scale = qimage_selection.scaledToWidth( int( self.export_width_value ), mode )
         elif ( self.export_width_state == False and self.export_height_state == True ):
@@ -1504,8 +1562,8 @@ class Tela_Extension( Extension ):
         self.Menu_Reset()
         check_canvas = self.Check_Canvas()
         if check_canvas == True:
-            boolean = QMessageBox.question( None, "TELA", f"Mirror Fix Selected Layer(s) ?\nSource = { SIGNAL_SIDE }", QMessageBox.Yes, QMessageBox.No )
-            if ( boolean == QMessageBox.Yes and SIGNAL_SIDE != None ):
+            boolean = QMessageBox.question( None, "TELA", f"Mirror Fix Selected Layer(s) ?\nSource = { SIGNAL_SIDE }", QMessageBox.StandardButton.Yes, QMessageBox.StandardButton.No )
+            if ( boolean == QMessageBox.StandardButton.Yes and SIGNAL_SIDE != None ):
                 self.MirrorFix_Run( SIGNAL_SIDE )
     def MirrorFix_Run( self, side ):
         check_canvas = self.Check_Canvas()
@@ -1869,14 +1927,14 @@ class Tela_Extension( Extension ):
         et = event.type()
         transform_widgets = list()
         # Geometry ( resize )
-        if self.qmdiarea != None:
-            if ( event.type() == QEvent.Resize and source == self.qmdiarea ):
+        if self.canvas_widget != None:
+            if ( event.type() == QEvent.Type.Resize and source == self.canvas_widget ):
                 self.Size_Update()
         # Krita ToolBox Signals
-        if ( et in [ QEvent.MouseButtonPress, QEvent.MouseButtonRelease, QEvent.PaletteChange ] and source in self.krita_toolbox ):
+        if ( et in [ QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease, QEvent.Type.PaletteChange ] and source in self.krita_toolbox ):
             self.Tool_Update()
         # Color Picker
-        if ( et == QEvent.Enter and source is self.color_picker ):
+        if ( et == QEvent.Type.Enter and source is self.color_picker ):
             self.Color_READ()
             return True
         return super().eventFilter( source, event )
