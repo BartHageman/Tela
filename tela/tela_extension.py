@@ -219,9 +219,9 @@ class Tela_Extension( Extension ):
         self.hide_tela = False
 
         # Pushbutton Size
-        self.pba = 35
-        self.pbb = 28
-        self.pbc = 20
+        self.pba = 52
+        self.pbb = 34
+        self.pbc = 24
         self.pbs = 5
         # Menu Margin
         self.mx = 10
@@ -460,20 +460,35 @@ class Tela_Extension( Extension ):
         else:               h3 = +0.3; p3 = +0.1 # Dark Theme
         handle   = QColor().fromHsvF( but[0], but[1], but[2] + h3 ).name()
         page     = QColor().fromHsvF( but[0], but[1], but[2] + p3 ).name()
-        # QPushbuttons
-        self.Interface_Highlight( self.menu_vector,       "menu_vector",    c_highlight, t_bright )
-        self.Interface_Highlight( self.menu_brush,        "menu_brush",     c_highlight, t_bright )
-        self.Interface_Highlight( self.menu_transform,    "menu_transform", c_highlight, t_bright )
-        self.Interface_Highlight( self.menu_color,        "menu_color",     c_highlight, t_bright )
-        self.Interface_Highlight( self.menu_overlay,      "menu_overlay",   c_highlight, t_bright )
-        self.Interface_Highlight( self.menu_select,       "menu_select",    c_highlight, t_bright )
-        self.Interface_Highlight( self.menu_camera,       "menu_camera",    c_highlight, t_bright )
+        # QPushbuttons — main row
+        self.Interface_Highlight( self.menu_krita,        "menu_krita",        c_highlight, t_bright )
+        self.Interface_Highlight( self.menu_vector,       "menu_vector",       c_highlight, t_bright )
+        self.Interface_Highlight( self.menu_brush,        "menu_brush",        c_highlight, t_bright )
+        self.Interface_Highlight( self.menu_transform,    "menu_transform",    c_highlight, t_bright )
+        self.Interface_Highlight( self.menu_color,        "menu_color",        c_highlight, t_bright )
+        self.Interface_Highlight( self.menu_overlay,      "menu_overlay",      c_highlight, t_bright )
+        self.Interface_Highlight( self.menu_select,       "menu_select",       c_highlight, t_bright )
+        self.Interface_Highlight( self.menu_camera,       "menu_camera",       c_highlight, t_bright )
+        self.Interface_Highlight( self.menu_break,        "menu_break",        c_highlight, t_bright )
         # Progress Bar
         progress_bar_style_sheet = self.ProgressBar_StyleSheet( c_highlight, a_black )
         self.progress_bar.setStyleSheet( progress_bar_style_sheet )
-        # Other Buttons
-        self.Interface_Highlight( self.menu_mirror_fix,   "mirror_fix",     c_highlight, t_bright )
-        self.Interface_Highlight( self.menu_color_picker, "color_picker",   c_highlight, t_bright )
+        # Extras
+        self.Interface_Highlight( self.menu_mirror_fix,   "menu_mirror_fix",   c_highlight, t_bright )
+        self.Interface_Highlight( self.menu_color_picker, "menu_color_picker", c_highlight, t_bright )
+        # Sub-panel — Transform
+        self.Interface_Highlight( self.spt_free,          "spt_free",          c_highlight, t_bright )
+        self.Interface_Highlight( self.spt_perspective,   "spt_perspective",   c_highlight, t_bright )
+        self.Interface_Highlight( self.spt_warp,          "spt_warp",          c_highlight, t_bright )
+        self.Interface_Highlight( self.spt_cage,          "spt_cage",          c_highlight, t_bright )
+        self.Interface_Highlight( self.spt_liquify,       "spt_liquify",       c_highlight, t_bright )
+        self.Interface_Highlight( self.spt_mesh,          "spt_mesh",          c_highlight, t_bright )
+        # Sub-panel — Select
+        self.Interface_Highlight( self.sps_invert,        "sps_invert",        c_highlight, t_bright )
+        self.Interface_Highlight( self.sps_all,           "sps_all",           c_highlight, t_bright )
+        self.Interface_Highlight( self.sps_none,          "sps_none",          c_highlight, t_bright )
+        # Hide
+        self.Interface_Highlight( self.menu_tela,         "menu_tela",         c_highlight, t_bright )
 
         # Color_Picker
         self.Interface_Slider( self.color_picker.s1, handle, w_mid, page, page )
@@ -503,6 +518,10 @@ class Tela_Extension( Extension ):
         # over whenever the user switches documents.
         self.qmdiarea.subWindowActivated.connect( self.Canvas_Changed )
         self.Canvas_Changed( self.qmdiarea.activeSubWindow() )
+
+        # Apply the theme stylesheet now; otherwise the buttons stay
+        # un-styled until the user switches view or theme.
+        self.Style_Theme()
         # Progress Bar
         self.krita_progress_bar = self.window.qwindow().statusBar().findChild( QProgressBar )
         self.krita_progress_bar.valueChanged.connect( self.Progress_Bar )
@@ -908,12 +927,14 @@ class Tela_Extension( Extension ):
         button.setMinimumSize( qsize )
         button.setMaximumSize( qsize )
         button.setFocusPolicy( Qt.FocusPolicy.NoFocus )
+        button.setCursor( Qt.CursorShape.PointingHandCursor )
         # QAbstract Button
         button.setText( "" )
         button.setCheckable( check )
         button.setAutoExclusive( exclusive )
-        # QPushbutton
-        button.setFlat( flat )
+        # QPushbutton — flat / borderless; the actual circular shape and
+        # state colors are applied via stylesheet in Interface_Highlight.
+        button.setFlat( True )
     def Interface_Progress_Bar( self, progress, name, pw, ph ):
         # Variables
         qsize = QSize( pw, ph )
@@ -923,13 +944,50 @@ class Tela_Extension( Extension ):
         progress.setMinimumSize( qsize )
         progress.setMaximumSize( qsize )
         progress.setFocusPolicy( Qt.FocusPolicy.NoFocus )
+        # Pure status indicator — let clicks fall through to the buttons
+        # underneath (the bar spans the full row width and would otherwise
+        # eat any pixel where it overlaps a button edge).
+        progress.setAttribute( Qt.WidgetAttribute.WA_TransparentForMouseEvents, True )
         # QProgress Bar
         progress.setMinimum( 0 )
         progress.setMaximum( 99 )
         progress.setValue( 0 )
-        progress.setTextVisible( False )        
+        progress.setTextVisible( False )
     def Interface_Highlight( self, button, name, background, pen ):
-        button.setStyleSheet( "#" + str( name ) + "::checked{ background-color : " + str( background ) + ";}" )
+        # Flat, circular, with six interaction states:
+        #   inactive / hovered / clicked / active / active-hovered / active-clicked
+        # The resting backdrop uses the theme's button colour at reduced
+        # opacity so white-on-dark and dark-on-light icons both keep contrast
+        # against arbitrary canvas content. Active states use the theme
+        # highlight; active-clicked is darker than active so the long-press
+        # interaction feels responsive even on an already-active tool.
+        palette = QApplication.palette()
+        btn = palette.button().color()
+        h = QColor( background )
+        r = min( button.minimumWidth(), button.minimumHeight() ) // 2
+
+        # Rule: hover = a touch brighter, click = a touch darker. Same alpha
+        # everywhere so the toolbar reads as one consistent translucent layer.
+        alpha = 255
+        def rgba( c ):
+            return "rgba({0},{1},{2},{3})".format( c.red(), c.green(), c.blue(), alpha )
+
+        inactive_bg       = rgba( btn )
+        hovered_bg        = rgba( btn.lighter( 120 ) )
+        clicked_bg        = rgba( btn.darker( 120 ) )
+        active_bg         = rgba( h )
+        active_hovered_bg = rgba( h.lighter( 120 ) )
+        active_clicked_bg = rgba( h.darker( 120 ) )
+
+        n = str( name )
+        button.setStyleSheet(
+            "#" + n + "{ background-color: " + inactive_bg + "; border: none; border-radius: " + str( r ) + "px; }"
+            "#" + n + ":hover{ background-color: " + hovered_bg + "; }"
+            "#" + n + ":pressed{ background-color: " + clicked_bg + "; }"
+            "#" + n + ":checked{ background-color: " + active_bg + "; }"
+            "#" + n + ":checked:hover{ background-color: " + active_hovered_bg + "; }"
+            "#" + n + ":checked:pressed{ background-color: " + active_clicked_bg + "; }"
+        )
     def Interface_Slider( self, widget, handle, border, page_sub, page_add ):
         style_sheet = str()
         style_sheet += "QSlider::groove:horizontal { border: 1px solid; height: 2px; }"
@@ -1025,9 +1083,9 @@ class Tela_Extension( Extension ):
             qmd_w = self.canvas_widget.width()
             qmd_h = self.canvas_widget.height()
             # Levels
-            l0 = 90
-            l1 = 55
-            l2 = 50
+            l0 = 103
+            l1 = 61
+            l2 = 56
             l3 = 25
             # Variables
             short = 20
