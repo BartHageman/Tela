@@ -19,6 +19,7 @@
 
 # Python Module
 import zipfile
+import json
 # Krita Module
 from krita import *
 # PyQt6 Modules
@@ -175,27 +176,18 @@ class Tela_Extension( Extension ):
                 "pan_tool"           : [ "Pan",         "PanTool",                           icon_pan_tool,           1 ],
                 },
         }
-        # Operation holds the favorite tools before starting
-        self.operation = {
-            "vector"    : "InteractionTool",
-            "brush"     : "KritaShape/KisToolBrush",
-            "transform" : "KisToolTransform",
-            "color"     : "KritaSelected/KisToolColorSampler",
-            "overlay"   : "ToolReferenceImages",
-            "select"    : "KisToolSelectOutline",
-            "camera"    : "PanTool",
-        }
+        # Flatten the fixed tool set above into a catalog, then build the
+        # runtime grouping ( primaries + secondaries ) from user config.
+        # This replaces the old hardcoded seven-group model. See Layout_Init.
+        self.Layout_Init()
         # Krita ToolBox ( Install Event Filter )
         self.krita_toolbox = list()
 
-        # Tool Box Widget
-        self.menu_vector = None
-        self.menu_brush = None
-        self.menu_transform = None
-        self.menu_color = None
-        self.menu_overlay = None
-        self.menu_select = None
-        self.menu_camera = None
+        # Tool Box Widget — primary buttons keyed by group id ( built in
+        # Interface_Create ). Fly-out buttons live in self.flyout_buttons.
+        self.primary = dict()
+        self.flyout_buttons = list()
+        self.flyout_items = list()   # [ ( button, gid, toolkey ) ] for hit-testing
         # Progress Bar Widget
         self.progress_bar = None
         # Actions Widget
@@ -203,15 +195,6 @@ class Tela_Extension( Extension ):
         self.menu_color_picker = None
         # Widgets Widget
         self.menu_tela = None
-
-        # Index
-        self.index_vector = "select_tool"
-        self.index_brush = "freehand_brush"
-        self.index_transform = "transform_tool"
-        self.index_color = "sampler_tool"
-        self.index_overlay = "reference_tool"
-        self.index_select = "freehand_select"
-        self.index_camera = "pan_tool"
 
         # State
         self.show_option = False
@@ -227,8 +210,7 @@ class Tela_Extension( Extension ):
         self.mx = 10
         self.my = 10
 
-        # Menu
-        self.press_time = 500 # 1000=1sec
+        # Menu — self.press_time ( hold duration ) is set from config in Layout_Init.
         self.menu_hold = None
 
         # Color Picker Module
@@ -286,6 +268,74 @@ class Tela_Extension( Extension ):
         return value
     def Kritarc_Write( self, group, key, value ):
         Krita.instance().writeSetting( group, key, str( value ) )
+
+    # Layout ( configurable primaries / secondaries )
+    def Layout_Init( self ):
+        # At this point self.tool still holds the hardcoded nested literal.
+        # Flatten it into a flat catalog ( the fixed Krita tool set ) and
+        # capture the literal's grouping as the default layout. The catalog
+        # keeps the SAME list objects, so Style_Icon updates propagate to
+        # every group that references a tool.
+        self.tool_catalog = dict()
+        default_groups = list()
+        for group in self.tool.values():
+            keys = list( group.keys() )
+            default_groups.append( keys )
+            for k in keys:
+                self.tool_catalog[k] = group[k]
+        # Load config, then build runtime structures.
+        self.layout = self.Layout_Load( default_groups )
+        self.press_time = self.layout["hold_ms"]
+        self.Layout_Build()
+    def Layout_Default( self, default_groups ):
+        return { "groups": default_groups, "hold_ms": 300 }
+    def Layout_Load( self, default_groups ):
+        default = self.Layout_Default( default_groups )
+        raw = Krita.instance().readSetting( EXTENSION_NAME, "layout", "" )
+        if raw in [ "", None ]:
+            self.Layout_Save( default )
+            return default
+        try:
+            data = json.loads( raw )
+            # Drop unknown tool keys and empty groups.
+            groups = [ [ k for k in g if k in self.tool_catalog ] for g in data["groups"] ]
+            groups = [ g for g in groups if len( g ) > 0 ]
+            if len( groups ) == 0:
+                raise ValueError( "no valid groups in layout config" )
+            hold_ms = int( data.get( "hold_ms", 300 ) )
+            return { "groups": groups, "hold_ms": hold_ms }
+        except Exception:
+            # Corrupt config — fall back to default rather than crash on load.
+            self.Layout_Save( default )
+            return default
+    def Layout_Save( self, layout ):
+        Krita.instance().writeSetting( EXTENSION_NAME, "layout", json.dumps( layout ) )
+    def Layout_Build( self ):
+        # Rebuild self.tool ( now keyed by opaque group id ) plus the per-group
+        # runtime state, all from the catalog + loaded layout. Group members
+        # reference the shared catalog lists. First member of each group is its
+        # primary / resting tool.
+        self.group_ids = list()
+        self.tool = dict()            # gid -> { toolkey: [label, action, icon, _] }
+        self.group_primary = dict()   # gid -> primary toolkey
+        self.index = dict()           # gid -> currently active toolkey
+        self.operation = dict()       # gid -> currently active action id
+        for i, keys in enumerate( self.layout["groups"] ):
+            gid = "g" + str( i )
+            self.group_ids.append( gid )
+            self.tool[gid] = dict()
+            for k in keys:
+                self.tool[gid][k] = self.tool_catalog[k]
+            primary = keys[0]
+            self.group_primary[gid] = primary
+            self.index[gid] = primary
+            self.operation[gid] = self.tool_catalog[primary][1]
+    def Group_Of_Tool( self, toolkey ):
+        # Which group id currently contains a tool key ( or None ).
+        for gid in self.group_ids:
+            if toolkey in self.tool[gid]:
+                return gid
+        return None
 
     # Warnnings
     def Message_Float( self, operation, message, icon ):
@@ -364,58 +414,54 @@ class Tela_Extension( Extension ):
         # Mirror Fix
         self.icon_mirrorfix = "wraparound"
 
-        # Toolbox ( name, pykrita, qicon )
-        self.tool["vector"]["select_tool"][2]       = icon_select_tool
-        self.tool["vector"]["text_tool"][2]         = icon_text_tool
-        self.tool["vector"]["edit_tool"][2]         = icon_edit_tool
-        self.tool["vector"]["calligraphy_tool"][2]  = icon_calligraphy_tool
+        # Toolbox ( name, pykrita, qicon ) — refresh icons on the shared catalog;
+        # every group references these list objects, so primaries update too.
+        self.tool_catalog["select_tool"][2]       = icon_select_tool
+        self.tool_catalog["text_tool"][2]         = icon_text_tool
+        self.tool_catalog["edit_tool"][2]         = icon_edit_tool
+        self.tool_catalog["calligraphy_tool"][2]  = icon_calligraphy_tool
         # Brush
-        self.tool["brush"]["freehand_brush"][2]     = icon_freehand_brush
-        self.tool["brush"]["line_brush"][2]         = icon_line_brush
-        self.tool["brush"]["rectangle_brush"][2]    = icon_rectangle_brush
-        self.tool["brush"]["ellipse_brush"][2]      = icon_ellipse_brush
-        self.tool["brush"]["polygon_brush"][2]      = icon_polygon_brush
-        self.tool["brush"]["polyline_brush"][2]     = icon_polyline_brush
-        self.tool["brush"]["bezier_brush"][2]       = icon_bezier_brush
-        self.tool["brush"]["path_brush"][2]         = icon_path_brush
-        self.tool["brush"]["dynamic_brush"][2]      = icon_dynamic_brush
-        self.tool["brush"]["multi_brush"][2]        = icon_multi_brush
+        self.tool_catalog["freehand_brush"][2]     = icon_freehand_brush
+        self.tool_catalog["line_brush"][2]         = icon_line_brush
+        self.tool_catalog["rectangle_brush"][2]    = icon_rectangle_brush
+        self.tool_catalog["ellipse_brush"][2]      = icon_ellipse_brush
+        self.tool_catalog["polygon_brush"][2]      = icon_polygon_brush
+        self.tool_catalog["polyline_brush"][2]     = icon_polyline_brush
+        self.tool_catalog["bezier_brush"][2]       = icon_bezier_brush
+        self.tool_catalog["path_brush"][2]         = icon_path_brush
+        self.tool_catalog["dynamic_brush"][2]      = icon_dynamic_brush
+        self.tool_catalog["multi_brush"][2]        = icon_multi_brush
         # Transform
-        self.tool["transform"]["transform_tool"][2] = icon_transform_tool
-        self.tool["transform"]["move_tool"][2]      = icon_move_tool
-        self.tool["transform"]["crop_tool"][2]      = icon_crop_tool
+        self.tool_catalog["transform_tool"][2] = icon_transform_tool
+        self.tool_catalog["move_tool"][2]      = icon_move_tool
+        self.tool_catalog["crop_tool"][2]      = icon_crop_tool
         # Color
-        self.tool["color"]["gradient_tool"][2]      = icon_gradient_tool
-        self.tool["color"]["sampler_tool"][2]       = icon_sampler_tool
-        self.tool["color"]["colorize_tool"][2]      = icon_colorize_tool
-        self.tool["color"]["patch_tool"][2]         = icon_patch_tool
-        self.tool["color"]["fill_tool"][2]          = icon_fill_tool
-        self.tool["color"]["enclose_tool"][2]       = icon_enclose_tool
+        self.tool_catalog["gradient_tool"][2]      = icon_gradient_tool
+        self.tool_catalog["sampler_tool"][2]       = icon_sampler_tool
+        self.tool_catalog["colorize_tool"][2]      = icon_colorize_tool
+        self.tool_catalog["patch_tool"][2]         = icon_patch_tool
+        self.tool_catalog["fill_tool"][2]          = icon_fill_tool
+        self.tool_catalog["enclose_tool"][2]       = icon_enclose_tool
         # Overlay
-        self.tool["overlay"]["assistant_tool"][2]   = icon_assistant_tool
-        self.tool["overlay"]["measure_tool"][2]     = icon_measure_tool
-        self.tool["overlay"]["reference_tool"][2]   = icon_reference_tool
+        self.tool_catalog["assistant_tool"][2]   = icon_assistant_tool
+        self.tool_catalog["measure_tool"][2]     = icon_measure_tool
+        self.tool_catalog["reference_tool"][2]   = icon_reference_tool
         # Select
-        self.tool["select"]["rectangle_select"][2]  = icon_rectangle_select
-        self.tool["select"]["elliptical_select"][2] = icon_elliptical_select
-        self.tool["select"]["polygon_select"][2]    = icon_polygon_select
-        self.tool["select"]["freehand_select"][2]   = icon_freehand_select
-        self.tool["select"]["contiguous_select"][2] = icon_contiguous_select
-        self.tool["select"]["color_select"][2]      = icon_color_select
-        self.tool["select"]["bezier_select"][2]     = icon_bezier_select
-        self.tool["select"]["magnetic_select"][2]   = icon_magnetic_select
+        self.tool_catalog["rectangle_select"][2]  = icon_rectangle_select
+        self.tool_catalog["elliptical_select"][2] = icon_elliptical_select
+        self.tool_catalog["polygon_select"][2]    = icon_polygon_select
+        self.tool_catalog["freehand_select"][2]   = icon_freehand_select
+        self.tool_catalog["contiguous_select"][2] = icon_contiguous_select
+        self.tool_catalog["color_select"][2]      = icon_color_select
+        self.tool_catalog["bezier_select"][2]     = icon_bezier_select
+        self.tool_catalog["magnetic_select"][2]   = icon_magnetic_select
         # Camera
-        self.tool["camera"]["zoom_tool"][2]         = icon_zoom_tool
-        self.tool["camera"]["pan_tool"][2]          = icon_pan_tool
+        self.tool_catalog["zoom_tool"][2]         = icon_zoom_tool
+        self.tool_catalog["pan_tool"][2]          = icon_pan_tool
 
-        # Tool Box
-        self.menu_vector.setIcon(    self.tool["vector"][self.index_vector][2] )
-        self.menu_brush.setIcon(     self.tool["brush"][self.index_brush][2] )
-        self.menu_transform.setIcon( self.tool["transform"][self.index_transform][2] )
-        self.menu_color.setIcon(     self.tool["color"][self.index_color][2] )
-        self.menu_overlay.setIcon(   self.tool["overlay"][self.index_overlay][2] )
-        self.menu_select.setIcon(    self.tool["select"][self.index_select][2] )
-        self.menu_camera.setIcon(    self.tool["camera"][self.index_camera][2] )
+        # Tool Box — each primary shows its currently active tool's icon.
+        for gid in self.group_ids:
+            self.primary[gid].setIcon( self.tool_catalog[self.index[gid]][2] )
         # Actions
         self.menu_mirror_fix.setIcon(    ki.icon( self.icon_mirrorfix )   )
         if self.pigmento_picker != None: self.menu_color_picker.setIcon( ki.icon( "krita_tool_ellipse" ) )
@@ -462,14 +508,12 @@ class Tela_Extension( Extension ):
         page     = QColor().fromHsvF( but[0], but[1], but[2] + p3 ).name()
         # QPushbuttons — main row
         self.Interface_Highlight( self.menu_krita,        "menu_krita",        c_highlight, t_bright )
-        self.Interface_Highlight( self.menu_vector,       "menu_vector",       c_highlight, t_bright )
-        self.Interface_Highlight( self.menu_brush,        "menu_brush",        c_highlight, t_bright )
-        self.Interface_Highlight( self.menu_transform,    "menu_transform",    c_highlight, t_bright )
-        self.Interface_Highlight( self.menu_color,        "menu_color",        c_highlight, t_bright )
-        self.Interface_Highlight( self.menu_overlay,      "menu_overlay",      c_highlight, t_bright )
-        self.Interface_Highlight( self.menu_select,       "menu_select",       c_highlight, t_bright )
-        self.Interface_Highlight( self.menu_camera,       "menu_camera",       c_highlight, t_bright )
+        for gid in self.group_ids:
+            self.Interface_Highlight( self.primary[gid], "primary_" + gid, c_highlight, t_bright )
         self.Interface_Highlight( self.menu_break,        "menu_break",        c_highlight, t_bright )
+        # Remember these palette colors so fly-out buttons can be styled to match.
+        self._hl_highlight = c_highlight
+        self._hl_text = t_bright
         # Progress Bar
         progress_bar_style_sheet = self.ProgressBar_StyleSheet( c_highlight, a_black )
         self.progress_bar.setStyleSheet( progress_bar_style_sheet )
@@ -531,62 +575,17 @@ class Tela_Extension( Extension ):
             self.Import_Pigment_O()
     def Toolbox_Button( self ):
         qwindow = Krita.instance().activeWindow().qwindow()
-        # Vector Checks
-        self.button_select_tool         = qwindow.findChild( QToolButton, self.tool["vector"]["select_tool"][1] )
-        self.button_text_tool           = qwindow.findChild( QToolButton, self.tool["vector"]["text_tool"][1] )
-        self.button_edit_tool           = qwindow.findChild( QToolButton, self.tool["vector"]["edit_tool"][1] )
-        self.button_calligraphy_tool    = qwindow.findChild( QToolButton, self.tool["vector"]["calligraphy_tool"][1] )
-        self.button_comic_tool          = qwindow.findChild( QToolButton, self.tool["vector"]["comic_tool"][1] )
-        # Brush Checks
-        self.button_freehand_brush      = qwindow.findChild( QToolButton, self.tool["brush"]["freehand_brush"][1] )
-        self.button_line_brush          = qwindow.findChild( QToolButton, self.tool["brush"]["line_brush"][1] )
-        self.button_rectangle_brush     = qwindow.findChild( QToolButton, self.tool["brush"]["rectangle_brush"][1] )
-        self.button_ellipse_brush       = qwindow.findChild( QToolButton, self.tool["brush"]["ellipse_brush"][1] )
-        self.button_polygon_brush       = qwindow.findChild( QToolButton, self.tool["brush"]["polygon_brush"][1] )
-        self.button_polyline_brush      = qwindow.findChild( QToolButton, self.tool["brush"]["polyline_brush"][1] )
-        self.button_bezier_brush        = qwindow.findChild( QToolButton, self.tool["brush"]["bezier_brush"][1] )
-        self.button_path_brush          = qwindow.findChild( QToolButton, self.tool["brush"]["path_brush"][1] )
-        self.button_dynamic_brush       = qwindow.findChild( QToolButton, self.tool["brush"]["dynamic_brush"][1] )
-        self.button_multi_brush         = qwindow.findChild( QToolButton, self.tool["brush"]["multi_brush"][1] )
-        # Transform Checks
-        self.button_transform_tool      = qwindow.findChild( QToolButton, self.tool["transform"]["transform_tool"][1] )
-        self.button_move_tool           = qwindow.findChild( QToolButton, self.tool["transform"]["move_tool"][1] )
-        self.button_crop_tool           = qwindow.findChild( QToolButton, self.tool["transform"]["crop_tool"][1] )
-        # Color Checks
-        self.button_gradient_tool       = qwindow.findChild( QToolButton, self.tool["color"]["gradient_tool"][1] )
-        self.button_sampler_tool        = qwindow.findChild( QToolButton, self.tool["color"]["sampler_tool"][1] )
-        self.button_colorize_tool       = qwindow.findChild( QToolButton, self.tool["color"]["colorize_tool"][1] )
-        self.button_patch_tool          = qwindow.findChild( QToolButton, self.tool["color"]["patch_tool"][1] )
-        self.button_fill_tool           = qwindow.findChild( QToolButton, self.tool["color"]["fill_tool"][1] )
-        self.button_enclose_tool        = qwindow.findChild( QToolButton, self.tool["color"]["enclose_tool"][1] )
-        # Overlay Checks
-        self.button_assistant_tool      = qwindow.findChild( QToolButton, self.tool["overlay"]["assistant_tool"][1] )
-        self.button_measure_tool        = qwindow.findChild( QToolButton, self.tool["overlay"]["measure_tool"][1] )
-        self.button_reference_tool      = qwindow.findChild( QToolButton, self.tool["overlay"]["reference_tool"][1] )
-        # Selection Checks
-        self.button_rectangle_select    = qwindow.findChild( QToolButton, self.tool["select"]["rectangle_select"][1] )
-        self.button_elliptical_select   = qwindow.findChild( QToolButton, self.tool["select"]["elliptical_select"][1] )
-        self.button_polygon_select      = qwindow.findChild( QToolButton, self.tool["select"]["polygon_select"][1] )
-        self.button_freehand_select     = qwindow.findChild( QToolButton, self.tool["select"]["freehand_select"][1] )
-        self.button_contiguous_select   = qwindow.findChild( QToolButton, self.tool["select"]["contiguous_select"][1] )
-        self.button_color_select        = qwindow.findChild( QToolButton, self.tool["select"]["color_select"][1] )
-        self.button_bezier_select       = qwindow.findChild( QToolButton, self.tool["select"]["bezier_select"][1] )
-        self.button_magnetic_select     = qwindow.findChild( QToolButton, self.tool["select"]["magnetic_select"][1] )
-        # Camera Checks
-        self.button_zoom_tool           = qwindow.findChild( QToolButton, self.tool["camera"]["zoom_tool"][1] )
-        self.button_pan_tool            = qwindow.findChild( QToolButton, self.tool["camera"]["pan_tool"][1] )
+        # Krita's native tool buttons, keyed by our tool id ( over the whole
+        # catalog, independent of grouping ). Used to read the active tool.
+        self.krita_button = dict()
+        for key, meta in self.tool_catalog.items():
+            self.krita_button[key] = qwindow.findChild( QToolButton, meta[1] )
     def Toolbox_Filter_Install( self ):
         # Variables
         app = QApplication.instance()
         list_widget = app.allWidgets()
-        list_key = list()
-        # Construct from toolbox
-        key_a = self.tool.keys()
-        for a in key_a:
-            key_b = self.tool[a].keys()
-            for b in key_b:
-                item = self.tool[a][b][1]
-                list_key.append( item )
+        # Watch every tool in the catalog, whether or not it is currently grouped.
+        list_key = [ meta[1] for meta in self.tool_catalog.values() ]
         # Cycle
         for widget in list_widget:
             name = widget.objectName()
@@ -609,152 +608,28 @@ class Tela_Extension( Extension ):
         # Canvas
         check_canvas = self.Check_Canvas()
         if check_canvas == True:
-            # Vector Checks
-            try:select_tool       = self.button_select_tool.isChecked()
-            except:pass
-            try:text_tool         = self.button_text_tool.isChecked()
-            except:pass
-            try:edit_tool         = self.button_edit_tool.isChecked()
-            except:pass
-            try:calligraphy_tool  = self.button_calligraphy_tool.isChecked()
-            except:pass
-            try:comic_tool        = self.button_comic_tool.isChecked()
-            except:pass
-            # Brush Checks
-            try:freehand_brush    = self.button_freehand_brush.isChecked()
-            except:pass
-            try:line_brush        = self.button_line_brush.isChecked()
-            except:pass
-            try:rectangle_brush   = self.button_rectangle_brush.isChecked()
-            except:pass
-            try:ellipse_brush     = self.button_ellipse_brush.isChecked()
-            except:pass
-            try:polygon_brush     = self.button_polygon_brush.isChecked()
-            except:pass
-            try:polyline_brush    = self.button_polyline_brush.isChecked()
-            except:pass
-            try:bezier_brush      = self.button_bezier_brush.isChecked()
-            except:pass
-            try:path_brush        = self.button_path_brush.isChecked()
-            except:pass
-            try:dynamic_brush     = self.button_dynamic_brush.isChecked()
-            except:pass
-            try:multi_brush       = self.button_multi_brush.isChecked()
-            except:pass
-            # Transform Checks
-            try:transform_tool    = self.button_transform_tool.isChecked()
-            except:pass
-            try:move_tool         = self.button_move_tool.isChecked()
-            except:pass
-            try:crop_tool         = self.button_crop_tool.isChecked()
-            except:pass
-            # Color Checks
-            try:gradient_tool     = self.button_gradient_tool.isChecked()
-            except:pass
-            try:sampler_tool      = self.button_sampler_tool.isChecked()
-            except:pass
-            try:colorize_tool     = self.button_colorize_tool.isChecked()
-            except:pass
-            try:patch_tool        = self.button_patch_tool.isChecked()
-            except:pass
-            try:fill_tool         = self.button_fill_tool.isChecked()
-            except:pass
-            try:enclose_tool      = self.button_enclose_tool.isChecked()
-            except:pass
-            # Overlay Checks
-            try:assistant_tool    = self.button_assistant_tool.isChecked()
-            except:pass
-            try:measure_tool      = self.button_measure_tool.isChecked()
-            except:pass
-            try:reference_tool    = self.button_reference_tool.isChecked()
-            except:pass
-            # Selection Checks
-            try:rectangle_select  = self.button_rectangle_select.isChecked()
-            except:pass
-            try:elliptical_select = self.button_elliptical_select.isChecked()
-            except:pass
-            try:polygon_select    = self.button_polygon_select.isChecked()
-            except:pass
-            try:freehand_select   = self.button_freehand_select.isChecked()
-            except:pass
-            try:contiguous_select = self.button_contiguous_select.isChecked()
-            except:pass
-            try:color_select      = self.button_color_select.isChecked()
-            except:pass
-            try:bezier_select     = self.button_bezier_select.isChecked()
-            except:pass
-            try:magnetic_select   = self.button_magnetic_select.isChecked()
-            except:pass
-            # Camera Checks
-            try:zoom_tool         = self.button_zoom_tool.isChecked()
-            except:pass
-            try:pan_tool          = self.button_pan_tool.isChecked()
-            except:pass
-
-            # Group
-            if   select_tool       == True : self.Tool_Apply( "vector",    "select_tool",       self.menu_vector )
-            elif text_tool         == True : self.Tool_Apply( "vector",    "text_tool",         self.menu_vector )
-            elif edit_tool         == True : self.Tool_Apply( "vector",    "edit_tool",         self.menu_vector )
-            elif calligraphy_tool  == True : self.Tool_Apply( "vector",    "calligraphy_tool",  self.menu_vector )
-            elif comic_tool        == True : self.Tool_Apply( "vector",    "comic_tool",        self.menu_vector )
-            # Brush Checks
-            elif freehand_brush    == True : self.Tool_Apply( "brush",     "freehand_brush",    self.menu_brush )
-            elif line_brush        == True : self.Tool_Apply( "brush",     "line_brush",        self.menu_brush )
-            elif rectangle_brush   == True : self.Tool_Apply( "brush",     "rectangle_brush",   self.menu_brush )
-            elif ellipse_brush     == True : self.Tool_Apply( "brush",     "ellipse_brush",     self.menu_brush )
-            elif polygon_brush     == True : self.Tool_Apply( "brush",     "polygon_brush",     self.menu_brush )
-            elif polyline_brush    == True : self.Tool_Apply( "brush",     "polyline_brush",    self.menu_brush )
-            elif bezier_brush      == True : self.Tool_Apply( "brush",     "bezier_brush",      self.menu_brush )
-            elif path_brush        == True : self.Tool_Apply( "brush",     "path_brush",        self.menu_brush )
-            elif dynamic_brush     == True : self.Tool_Apply( "brush",     "dynamic_brush",     self.menu_brush )
-            elif multi_brush       == True : self.Tool_Apply( "brush",     "multi_brush",       self.menu_brush )
-            # Transform Checks
-            elif transform_tool    == True : self.Tool_Apply( "transform", "transform_tool",    self.menu_transform )
-            elif move_tool         == True : self.Tool_Apply( "transform", "move_tool",         self.menu_transform )
-            elif crop_tool         == True : self.Tool_Apply( "transform", "crop_tool",         self.menu_transform )
-            # Color Checks
-            elif gradient_tool     == True : self.Tool_Apply( "color",     "gradient_tool",     self.menu_color )
-            elif sampler_tool      == True : self.Tool_Apply( "color",     "sampler_tool",      self.menu_color )
-            elif colorize_tool     == True : self.Tool_Apply( "color",     "colorize_tool",     self.menu_color )
-            elif patch_tool        == True : self.Tool_Apply( "color",     "patch_tool",        self.menu_color )
-            elif fill_tool         == True : self.Tool_Apply( "color",     "fill_tool",         self.menu_color )
-            elif enclose_tool      == True : self.Tool_Apply( "color",     "enclose_tool",      self.menu_color )
-            # Overlay Checks
-            elif assistant_tool    == True : self.Tool_Apply( "overlay",   "assistant_tool",    self.menu_overlay )
-            elif measure_tool      == True : self.Tool_Apply( "overlay",   "measure_tool",      self.menu_overlay )
-            elif reference_tool    == True : self.Tool_Apply( "overlay",   "reference_tool",    self.menu_overlay )
-            # Selection Checks
-            elif rectangle_select  == True : self.Tool_Apply( "select",    "rectangle_select",  self.menu_select )
-            elif elliptical_select == True : self.Tool_Apply( "select",    "elliptical_select", self.menu_select )
-            elif polygon_select    == True : self.Tool_Apply( "select",    "polygon_select",    self.menu_select )
-            elif freehand_select   == True : self.Tool_Apply( "select",    "freehand_select",   self.menu_select )
-            elif contiguous_select == True : self.Tool_Apply( "select",    "contiguous_select", self.menu_select )
-            elif color_select      == True : self.Tool_Apply( "select",    "color_select",      self.menu_select )
-            elif bezier_select     == True : self.Tool_Apply( "select",    "bezier_select",     self.menu_select )
-            elif magnetic_select   == True : self.Tool_Apply( "select",    "magnetic_select",   self.menu_select )
-            # Camera Checks
-            elif zoom_tool         == True : self.Tool_Apply( "camera",    "zoom_tool",         self.menu_camera )
-            elif pan_tool          == True : self.Tool_Apply( "camera",    "pan_tool",          self.menu_camera )
-            # Error
-            else:self.Message_Float( "ERROR", "new tool present ?", "broken-preset" )
+            # Find which catalog tool Krita currently has active ( exclusive,
+            # so at most one ), then reflect it on its group's primary button.
+            active_key = None
+            for key, button in self.krita_button.items():
+                try:
+                    if button.isChecked():
+                        active_key = key
+                        break
+                except:
+                    pass
+            if active_key is not None:
+                gid = self.Group_Of_Tool( active_key )
+                if gid is not None:
+                    self.Tool_Apply( gid, active_key )
             # Clean
             self.Tela_Geometry( self.show_option, self.show_extra, self.hide_tela )
-    def Tool_Apply( self, mode, tool, widget ):
-        # Variables
-        operation = self.tool[mode][tool][1]
-        qicon = self.tool[mode][tool][2]
-        if mode == "vector":    self.index_vector = tool
-        if mode == "brush":     self.index_brush = tool
-        if mode == "transform": self.index_transform = tool
-        if mode == "color":     self.index_color = tool
-        if mode == "overlay":   self.index_overlay = tool
-        if mode == "select":    self.index_select = tool
-        if mode == "camera":    self.index_camera = tool
-        # Tool
-        self.operation[mode] = operation
-        # UI
-        widget.setIcon( qicon )
-        widget.setChecked( True )
+    def Tool_Apply( self, gid, tool ):
+        # Reflect the active tool on its group's primary button.
+        self.index[gid] = tool
+        self.operation[gid] = self.tool_catalog[tool][1]
+        self.primary[gid].setIcon( self.tool_catalog[tool][2] )
+        self.primary[gid].setChecked( True )
 
     # Interface
     def Interface_Create( self, parent ):
@@ -763,15 +638,11 @@ class Tela_Extension( Extension ):
         # Variables
         bar = ( self.pba * 7 ) + ( self.pbs * 6 )
 
-        # Tool Box
+        # Tool Box — one primary button per configured group ( variable count ).
         self.menu_krita        = QPushButton( "menu_krita", parent )
-        self.menu_vector       = QPushButton( "menu_vector", parent )
-        self.menu_brush        = QPushButton( "menu_brush", parent )
-        self.menu_transform    = QPushButton( "menu_transform", parent )
-        self.menu_color        = QPushButton( "menu_color", parent )
-        self.menu_overlay      = QPushButton( "menu_overlay", parent )
-        self.menu_select       = QPushButton( "menu_select", parent )
-        self.menu_camera       = QPushButton( "menu_camera", parent )
+        self.primary = dict()
+        for gid in self.group_ids:
+            self.primary[gid] = QPushButton( "primary_" + gid, parent )
         self.menu_break        = QPushButton( "menu_break", parent )
         # Progress Bar
         self.progress_bar      = QProgressBar( parent )
@@ -794,13 +665,8 @@ class Tela_Extension( Extension ):
 
         # Tool Box
         self.Interface_Push_Button(  self.menu_krita,        "menu_krita",        self.pbc, self.pba, False, False, False )
-        self.Interface_Push_Button(  self.menu_vector,       "menu_vector",       self.pba, self.pba, True,  True,  False )
-        self.Interface_Push_Button(  self.menu_brush,        "menu_brush",        self.pba, self.pba, True,  True,  False )
-        self.Interface_Push_Button(  self.menu_transform,    "menu_transform",    self.pba, self.pba, True,  True,  False )
-        self.Interface_Push_Button(  self.menu_color,        "menu_color",        self.pba, self.pba, True,  True,  False )
-        self.Interface_Push_Button(  self.menu_overlay,      "menu_overlay",      self.pba, self.pba, True,  True,  False )
-        self.Interface_Push_Button(  self.menu_select,       "menu_select",       self.pba, self.pba, True,  True,  False )
-        self.Interface_Push_Button(  self.menu_camera,       "menu_camera",       self.pba, self.pba, True,  True,  False )
+        for gid in self.group_ids:
+            self.Interface_Push_Button( self.primary[gid], "primary_" + gid, self.pba, self.pba, True, True, False )
         self.Interface_Push_Button(  self.menu_break,        "menu_break",        self.pbc, self.pba, False, False, False )
         # Progress Bar
         self.Interface_Progress_Bar( self.progress_bar,      "progress_bar",      bar,      self.pbs )
@@ -827,27 +693,10 @@ class Tela_Extension( Extension ):
         # Krita Menu
         self.menu_krita.pressed.connect( self.Hold_Krita )
         self.menu_krita.released.connect( self.Release_Krita )
-        # Vector
-        self.menu_vector.pressed.connect( self.Hold_Vector )
-        self.menu_vector.released.connect( self.Release_Vector )
-        # Brush
-        self.menu_brush.pressed.connect( self.Hold_Brush )
-        self.menu_brush.released.connect( self.Release_Brush )
-        # Transform
-        self.menu_transform.pressed.connect( self.Hold_Transform )
-        self.menu_transform.released.connect( self.Release_Transform )
-        # Color
-        self.menu_color.pressed.connect( self.Hold_Color )
-        self.menu_color.released.connect( self.Release_Color )
-        # Overlay
-        self.menu_overlay.pressed.connect( self.Hold_Overlay )
-        self.menu_overlay.released.connect( self.Release_Overlay )
-        # Select
-        self.menu_select.pressed.connect( self.Hold_Select )
-        self.menu_select.released.connect( self.Release_Select )
-        # Camera
-        self.menu_camera.pressed.connect( self.Hold_Camera )
-        self.menu_camera.released.connect( self.Release_Camera )
+        # Primaries — hold reveals the group fly-out; click/release picks the primary.
+        for gid in self.group_ids:
+            self.primary[gid].pressed.connect(  lambda g=gid: self.Hold_Primary( g ) )
+            self.primary[gid].released.connect( lambda g=gid: self.Release_Primary( g ) )
         # Break
         self.menu_break.pressed.connect( self.Hold_Break )
         self.menu_break.released.connect( self.Release_Break )
@@ -890,13 +739,8 @@ class Tela_Extension( Extension ):
         ki = Krita.instance()
         # Tool Box
         self.menu_krita.setIcon(        ki.icon( "hamburger_menu_dots" ) )
-        self.menu_vector.setIcon(       self.tool["vector"][self.index_vector][2] )
-        self.menu_brush.setIcon(        self.tool["brush"][self.index_brush][2] )
-        self.menu_transform.setIcon(    self.tool["transform"][self.index_transform][2] )
-        self.menu_color.setIcon(        self.tool["color"][self.index_color][2] )
-        self.menu_overlay.setIcon(      self.tool["overlay"][self.index_overlay][2] )
-        self.menu_select.setIcon(       self.tool["select"][self.index_select][2] )
-        self.menu_camera.setIcon(       self.tool["camera"][self.index_camera][2] )
+        for gid in self.group_ids:
+            self.primary[gid].setIcon( self.tool_catalog[self.index[gid]][2] )
         self.menu_break.setIcon(        ki.icon( "hamburger_menu_dots" ) )
         # Transform
         self.spt_free.setIcon(          ki.icon( "transform_icons_main" ) )
@@ -999,8 +843,8 @@ class Tela_Extension( Extension ):
     # Canvas attachment
     def Overlay_Widgets( self ):
         return [
-            self.menu_krita, self.menu_vector, self.menu_brush, self.menu_transform,
-            self.menu_color, self.menu_overlay, self.menu_select, self.menu_camera,
+            self.menu_krita,
+            *[ self.primary[gid] for gid in self.group_ids ],
             self.menu_break,
             self.progress_bar,
             self.menu_mirror_fix, self.menu_color_picker,
@@ -1091,47 +935,47 @@ class Tela_Extension( Extension ):
             short = 20
             wide = 50
             # Calculations
-            w2 = ( self.pba * 2 ) + ( self.pbs * 1 )
+            step = self.pba + self.pbs
+            n = len( self.group_ids )
+            # Sub-panel widths are fixed ( 6 transform modes, 3 select ops ).
             w3 = ( self.pba * 3 ) + ( self.pbs * 2 )
-            w4 = ( self.pba * 4 ) + ( self.pbs * 3 )
-            w5 = ( self.pba * 5 ) + ( self.pbs * 4 )
             w6 = ( self.pba * 6 ) + ( self.pbs * 5 )
-            w7 = ( self.pba * 7 ) + ( self.pbs * 6 )
-            px2 = qmd_w * 0.5 - w2 * 0.5
             px3 = qmd_w * 0.5 - w3 * 0.5
-            px4 = qmd_w * 0.5 - w4 * 0.5
-            px5 = qmd_w * 0.5 - w5 * 0.5
             px6 = qmd_w * 0.5 - w6 * 0.5
-            px7 = qmd_w * 0.5 - w7 * 0.5
+            # Primary row: width scales with the number of configured primaries.
+            bar_w = ( self.pba * n ) + ( self.pbs * ( n - 1 ) ) if n > 0 else 0
+            px = qmd_w * 0.5 - bar_w * 0.5
             offscreen = 100
             dh = int( hide_tela * offscreen )
-            # Sub Panel Transform
-            check_transform = self.show_option == True and self.menu_transform.isChecked() == True and self.index_transform == "transform_tool"
+            # Which primary ( if any ) is currently active, and its tool.
+            active_tool = None
+            for gid in self.group_ids:
+                if self.primary[gid].isChecked():
+                    active_tool = self.index[gid]
+                    break
+            # Sub Panel Transform — shown when the Transform tool itself is active.
+            check_transform = self.show_option == True and active_tool == "transform_tool"
             if check_transform == True:     dt = dh
             else:                           dt = offscreen
-            # Sub Panel Select
-            check_select = self.show_option == True and self.menu_select.isChecked() == True
+            # Sub Panel Select — shown when any selection tool is active.
+            select_tools = [ k for k in self.tool_catalog if k.endswith( "_select" ) ]
+            check_select = self.show_option == True and active_tool in select_tools
             if check_select == True:        ds = dh
             else:                           ds = offscreen
             # Extra
             if self.show_extra == True:    de = dh
             else:                           de = offscreen
 
-            # Tool Box
-            self.menu_krita.setGeometry(        int( px7 - self.pbc*1 - self.pbs*1 ), int( qmd_h-l0+dh ),    self.pbc,  self.pba )
-            self.menu_vector.setGeometry(       int( px7 ),                           int( qmd_h-l0+dh ),    self.pba,  self.pba )
-            self.menu_brush.setGeometry(        int( px7 + self.pba*1 + self.pbs*1 ), int( qmd_h-l0+dh ),    self.pba,  self.pba )
-            self.menu_transform.setGeometry(    int( px7 + self.pba*2 + self.pbs*2 ), int( qmd_h-l0+dh ),    self.pba,  self.pba )
-            self.menu_color.setGeometry(        int( px7 + self.pba*3 + self.pbs*3 ), int( qmd_h-l0+dh ),    self.pba,  self.pba )
-            self.menu_overlay.setGeometry(      int( px7 + self.pba*4 + self.pbs*4 ), int( qmd_h-l0+dh ),    self.pba,  self.pba )
-            self.menu_select.setGeometry(       int( px7 + self.pba*5 + self.pbs*5 ), int( qmd_h-l0+dh ),    self.pba,  self.pba )
-            self.menu_camera.setGeometry(       int( px7 + self.pba*6 + self.pbs*6 ), int( qmd_h-l0+dh ),    self.pba,  self.pba )
-            self.menu_break.setGeometry(        int( px7 + self.pba*7 + self.pbs*7 ), int( qmd_h-l0+dh ),    self.pbc,  self.pba )
+            # Tool Box — krita button, then N primaries, then break; row centered.
+            self.menu_krita.setGeometry(        int( px - self.pbc*1 - self.pbs*1 ), int( qmd_h-l0+dh ),    self.pbc,  self.pba )
+            for i, gid in enumerate( self.group_ids ):
+                self.primary[gid].setGeometry( int( px + step*i ), int( qmd_h-l0+dh ), self.pba, self.pba )
+            self.menu_break.setGeometry(        int( px + step*n ),                 int( qmd_h-l0+dh ),    self.pbc,  self.pba )
             # Progress Bar
-            self.progress_bar.setGeometry(      int( px7 ),                           int( qmd_h-l1+dh ),    int( w7 ), self.pbs )
+            self.progress_bar.setGeometry(      int( px ),                          int( qmd_h-l1+dh ),    int( bar_w ), self.pbs )
             # Extras
-            self.menu_mirror_fix.setGeometry(   int( px7 + self.pba*8 + self.pbs*8 ), int( qmd_h-l0+de ),    self.pba,  self.pba )
-            self.menu_color_picker.setGeometry( int( px7 + self.pba*9 + self.pbs*9 ), int( qmd_h-l0+de ),    self.pba,  self.pba )
+            self.menu_mirror_fix.setGeometry(   int( px + step*(n+1) ),             int( qmd_h-l0+de ),    self.pba,  self.pba )
+            self.menu_color_picker.setGeometry( int( px + step*(n+2) ),             int( qmd_h-l0+de ),    self.pba,  self.pba )
             # Transform
             self.spt_free.setGeometry(          int( px6 ),                           int( qmd_h-l2+dt ),    self.pba,  self.pbb )
             self.spt_perspective.setGeometry(   int( px6 + self.pba*1 + self.pbs*1 ), int( qmd_h-l2+dt ),    self.pba,  self.pbb )
@@ -1325,65 +1169,34 @@ class Tela_Extension( Extension ):
         # Clean up
         self.Menu_Down()
 
-    # Hold
-    def Hold_Vector( self ):
+    # Hold — reveal a group's fly-out after the configured press delay.
+    # A QPushButton re-emits pressed/released as the cursor crosses its edge
+    # during a drag; ignore those so a press-and-drag gesture neither tears the
+    # open fly-out down nor keeps resetting the open timer.
+    def Hold_Primary( self, gid ):
+        if len( self.flyout_items ) > 0:
+            return
+        if self.menu_hold is not None and self.menu_hold.isActive():
+            return
         self.Menu_Reset()
-        self.Menu_Timer_Start( self.Menu_Vector )
-    def Hold_Brush( self ):
+        self.Menu_Timer_Start( lambda: self.Menu_Primary( gid ) )
+
+    # Release — a plain click ( shorter than press_time ) confirms the primary.
+    # If a hold already opened the fly-out, leave it up; it dismisses on pick
+    # or on a click elsewhere, not when the button is released.
+    def Release_Primary( self, gid ):
+        if len( self.flyout_buttons ) > 0:
+            return
         self.Menu_Reset()
-        self.Menu_Timer_Start( self.Menu_Brush )
-    def Hold_Transform( self ):
-        self.Menu_Reset()
-        self.Menu_Timer_Start( self.Menu_Transform )
-    def Hold_Color( self ):
-        self.Menu_Reset()
-        self.Menu_Timer_Start( self.Menu_Color )
-    def Hold_Overlay( self ):
-        self.Menu_Reset()
-        self.Menu_Timer_Start( self.Menu_Overlay )
-    def Hold_Select( self ):
-        self.Menu_Reset()
-        self.Menu_Timer_Start( self.Menu_Select )
-    def Hold_Camera( self ):
-        self.Menu_Reset()
-        self.Menu_Timer_Start( self.Menu_Camera )
-        
-    # Release
-    def Release_Vector( self ):
-        self.Menu_Reset()
-        self.action_tool_vector.setChecked( True )
-        Krita.instance().action( self.operation["vector"] ).trigger()
+        slot = self.group_ids.index( gid )
+        if slot < len( self.action_tool ):
+            self.action_tool[slot].setChecked( True )
+        Krita.instance().action( self.operation[gid] ).trigger()
         self.Tela_Geometry( self.show_option, self.show_extra, self.hide_tela )
-    def Release_Brush( self ):
-        self.Menu_Reset()
-        self.action_tool_brush.setChecked( True )
-        Krita.instance().action( self.operation["brush"] ).trigger()
-        self.Tela_Geometry( self.show_option, self.show_extra, self.hide_tela )
-    def Release_Transform( self ):
-        self.Menu_Reset()
-        self.action_tool_transform.setChecked( True )
-        Krita.instance().action( self.operation["transform"] ).trigger()
-        self.Tela_Geometry( self.show_option, self.show_extra, self.hide_tela )
-    def Release_Color( self ):
-        self.Menu_Reset()
-        self.action_tool_color.setChecked( True )
-        Krita.instance().action( self.operation["color"] ).trigger()
-        self.Tela_Geometry( self.show_option, self.show_extra, self.hide_tela )
-    def Release_Overlay( self ):
-        self.Menu_Reset()
-        self.action_tool_overlay.setChecked( True )
-        Krita.instance().action( self.operation["overlay"] ).trigger()
-        self.Tela_Geometry( self.show_option, self.show_extra, self.hide_tela )
-    def Release_Select( self ):
-        self.Menu_Reset()
-        self.action_tool_select.setChecked( True )
-        Krita.instance().action( self.operation["select"] ).trigger()
-        self.Tela_Geometry( self.show_option, self.show_extra, self.hide_tela )
-    def Release_Camera( self ):
-        self.Menu_Reset()
-        self.action_tool_camera.setChecked( True )
-        Krita.instance().action( self.operation["camera"] ).trigger()
-        self.Tela_Geometry( self.show_option, self.show_extra, self.hide_tela )
+    def Release_Slot( self, slot ):
+        # Krita shortcut action for primary slot N ( 0-based ).
+        if slot < len( self.group_ids ):
+            self.Release_Primary( self.group_ids[slot] )
 
     # Menu
     def Menu_Timer_Start( self, function ):
@@ -1395,15 +1208,11 @@ class Tela_Extension( Extension ):
     def Menu_Reset( self ):
         self.Menu_Timer_Stop()
         self.Menu_Clear()
+        self.Flyout_Close()
         self.color_picker.hide()
         # Actions
-        self.action_tool_vector.setChecked( False )
-        self.action_tool_brush.setChecked( False )
-        self.action_tool_transform.setChecked( False )
-        self.action_tool_color.setChecked( False )
-        self.action_tool_overlay.setChecked( False )
-        self.action_tool_select.setChecked( False )
-        self.action_tool_camera.setChecked( False )
+        for action in self.action_tool:
+            action.setChecked( False )
     def Menu_Timer_Stop( self ):
         try:self.menu_hold.stop()
         except:pass
@@ -1414,82 +1223,81 @@ class Tela_Extension( Extension ):
         # Krita
         self.menu_krita.setDown( False )
         # Toolbox
-        self.menu_vector.setDown( False )
-        self.menu_brush.setDown( False )
-        self.menu_transform.setDown( False )
-        self.menu_color.setDown( False )
-        self.menu_overlay.setDown( False )
-        self.menu_select.setDown( False )
-        self.menu_camera.setDown( False )
+        for gid in self.group_ids:
+            self.primary[gid].setDown( False )
         # Other
         self.menu_mirror_fix.setDown( False )
         self.menu_color_picker.setDown( False )
-    # Menu
-    def Menu_Vector( self ):
-        self.Menu_Toolbox( "vector", self.menu_vector )
-    def Menu_Brush( self ):
-        self.Menu_Toolbox( "brush", self.menu_brush )
-    def Menu_Transform( self ):
-        self.Menu_Toolbox( "transform", self.menu_transform )
-    def Menu_Color( self ):
-        self.Menu_Toolbox( "color", self.menu_color )
-    def Menu_Overlay( self ):
-        self.Menu_Toolbox( "overlay", self.menu_overlay )
-    def Menu_Select( self ):
-        self.Menu_Toolbox( "select", self.menu_select )
-    def Menu_Camera( self ):
-        self.Menu_Toolbox( "camera", self.menu_camera )
-    # Menu
-    def Menu_Toolbox( self, mode, widget ):
-        # Variables
-        ki = Krita.instance()
-        key = list( self.tool[mode].keys() )
-        len_key = len( key )
-
-        # Menu
-        self.qmenu = QMenu()
-
-        # Actions
-        action_menu = list()
-        for k in key:
-            string = self.tool[mode][k][0]
-            qicon = self.tool[mode][k][2]
-            action_menu.append( QAction( qicon, string ) )
-        self.qmenu.addActions( action_menu )
-
-        # Mapping
-        size = 23  # 23 is the expected height of a self.qmenu item on windows at least
-        height = size * len_key + self.my
-        qpoint = widget.geometry().topLeft()
-        pos = self.canvas_widget.mapToGlobal( qpoint )
-        point = QPoint( pos.x(), pos.y() - height )
-        action = self.qmenu.exec( point )
-
-        # Pin
-        if action in action_menu:
-            # Variables
-            index = action_menu.index( action )
-            tool = key[index]
-            operation = self.tool[mode][tool][1]
-            qicon = self.tool[mode][tool][2]
-            # Tool
-            ki.action( operation ).trigger()
-            self.operation[mode] = operation
-            # UI
-            widget.setIcon( qicon )
-            widget.setChecked( True )
-            # Index
-            if mode == "vector":    self.index_vector = tool
-            if mode == "brush":     self.index_brush = tool
-            if mode == "transform": self.index_transform = tool
-            if mode == "color":     self.index_color = tool
-            if mode == "overlay":   self.index_overlay = tool
-            if mode == "select":    self.index_select = tool
-            if mode == "camera":    self.index_camera = tool
-
-        # Clean up
+    # Fly-out — a vertical stack of real icon buttons above the held primary,
+    # replacing the old text-only QMenu. Dismissed on pick or click elsewhere.
+    def Menu_Primary( self, gid ):
+        self.Flyout_Close()
+        if self.canvas_widget is None:
+            return
+        keys = list( self.tool[gid].keys() )
+        geo = self.primary[gid].geometry()
+        x = geo.x()
+        y = geo.y()
+        # Stack upward from just above the primary; first member nearest it.
+        for i, key in enumerate( keys ):
+            name = "flyout_" + key
+            button = QPushButton( self.canvas_widget )
+            # Checkable ( non-exclusive ) so the cursor's target can be lit via
+            # the :checked style while dragging — real hover events don't arrive
+            # during a press-drag ( the primary holds the mouse grab ).
+            self.Interface_Push_Button( button, name, self.pba, self.pba, True, False, False )
+            button.setIcon( self.tool_catalog[key][2] )
+            button.setToolTip( self.tool_catalog[key][0] )
+            try:
+                self.Interface_Highlight( button, name, self._hl_highlight, self._hl_text )
+            except:
+                pass
+            by = y - ( self.pba + self.pbs ) * ( i + 1 )
+            button.setGeometry( x, int( by ), self.pba, self.pba )
+            button.show()
+            button.raise_()
+            self.flyout_buttons.append( button )
+            self.flyout_items.append( ( button, gid, key ) )
+        # We don't rely on the buttons receiving their own clicks ( on Krita 6's
+        # native GL canvas they don't ). Instead an app-wide filter hit-tests the
+        # cursor against the fly-out on press ( click ) and release ( drag ).
+        QApplication.instance().installEventFilter( self )
+        self.Menu_Down()
+    def Flyout_Hit( self, global_point ):
+        for button, gid, key in self.flyout_items:
+            top_left = button.mapToGlobal( QtCore.QPoint( 0, 0 ) )
+            if QtCore.QRect( top_left, button.size() ).contains( global_point ):
+                return ( gid, key )
+        return None
+    def Flyout_Highlight( self, global_point ):
+        # Light the button under the cursor ( :checked ), clear the rest.
+        for button, gid, key in self.flyout_items:
+            top_left = button.mapToGlobal( QtCore.QPoint( 0, 0 ) )
+            inside = QtCore.QRect( top_left, button.size() ).contains( global_point )
+            button.setChecked( inside )
+    def Flyout_Pick( self, gid, tool ):
+        operation = self.tool_catalog[tool][1]
+        Krita.instance().action( operation ).trigger()
+        self.index[gid] = tool
+        self.operation[gid] = operation
+        self.primary[gid].setIcon( self.tool_catalog[tool][2] )
+        self.primary[gid].setChecked( True )
+        self.Flyout_Close()
         self.Menu_Down()
         self.Tela_Geometry( self.show_option, self.show_extra, self.hide_tela )
+    def Flyout_Close( self ):
+        if len( self.flyout_buttons ) == 0:
+            return
+        for button in self.flyout_buttons:
+            button.hide()
+            button.setParent( None )
+            button.deleteLater()
+        self.flyout_buttons = list()
+        self.flyout_items = list()
+        try:
+            QApplication.instance().removeEventFilter( self )
+        except:
+            pass
 
     # Progress Bar
     def Progress_Bar( self, value ):
@@ -1984,6 +1792,26 @@ class Tela_Extension( Extension ):
         # Variables
         et = event.type()
         transform_widgets = list()
+        # Fly-out interaction, by cursor position ( not event target — the native
+        # GL canvas eats clicks meant for the overlay buttons ):
+        #   - press  over a secondary -> select it ( click model )
+        #   - release over a secondary -> select it ( press-drag-release model )
+        #   - press  outside          -> dismiss
+        #   - release outside         -> leave open ( ends the hold, keeps the menu )
+        if ( len( self.flyout_items ) > 0 and et in [ QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease ] ):
+            try:    gp = event.globalPosition().toPoint()
+            except: gp = QCursor().pos()
+            hit = self.Flyout_Hit( gp )
+            if hit is not None:
+                self.Flyout_Pick( hit[0], hit[1] )
+                return True
+            if et == QEvent.Type.MouseButtonPress:
+                self.Flyout_Close()
+        # Live feedback: highlight the secondary under the cursor while open.
+        if ( len( self.flyout_items ) > 0 and et == QEvent.Type.MouseMove ):
+            try:    gp = event.globalPosition().toPoint()
+            except: gp = QCursor().pos()
+            self.Flyout_Highlight( gp )
         # Geometry ( resize )
         if self.canvas_widget != None:
             if ( event.type() == QEvent.Type.Resize and source == self.canvas_widget ):
@@ -2014,28 +1842,22 @@ class Tela_Extension( Extension ):
         action_mirror_fix = window.createAction( "mirror_fix_menu", "Mirror Fix", "tools/scripts/tela_menu" )
         action_mirror_fix.setMenu( menu_mirror_fix )
 
-        # Toolbox
-        self.action_tool_vector      = window.createAction( "tela_extension_tool_vector",    "Tool1 Vector",      "tools/scripts/tela_menu/toolbox_menu" )
-        self.action_tool_brush       = window.createAction( "tela_extension_tool_brush",     "Tool2 Brush",       "tools/scripts/tela_menu/toolbox_menu" )
-        self.action_tool_transform   = window.createAction( "tela_extension_tool_transform", "Tool3 Transform",   "tools/scripts/tela_menu/toolbox_menu" )
-        self.action_tool_color       = window.createAction( "tela_extension_tool_color",     "Tool4 Color",       "tools/scripts/tela_menu/toolbox_menu" )
-        self.action_tool_overlay     = window.createAction( "tela_extension_tool_overlay",   "Tool5 Overlay",     "tools/scripts/tela_menu/toolbox_menu" )
-        self.action_tool_select      = window.createAction( "tela_extension_tool_select",    "Tool6 Select",      "tools/scripts/tela_menu/toolbox_menu" )
-        self.action_tool_camera      = window.createAction( "tela_extension_tool_camera",    "Tool7 Camera",      "tools/scripts/tela_menu/toolbox_menu" )
-        self.action_tool_vector.setCheckable( True )
-        self.action_tool_brush.setCheckable( True )
-        self.action_tool_transform.setCheckable( True )
-        self.action_tool_color.setCheckable( True )
-        self.action_tool_overlay.setCheckable( True )
-        self.action_tool_select.setCheckable( True )
-        self.action_tool_camera.setCheckable( True )
-        self.action_tool_vector.triggered.connect( self.Release_Vector )
-        self.action_tool_brush.triggered.connect( self.Release_Brush )
-        self.action_tool_transform.triggered.connect( self.Release_Transform )
-        self.action_tool_color.triggered.connect( self.Release_Color )
-        self.action_tool_overlay.triggered.connect( self.Release_Overlay )
-        self.action_tool_select.triggered.connect( self.Release_Select )
-        self.action_tool_camera.triggered.connect( self.Release_Camera )
+        # Toolbox — seven shortcut slots that select primary 1..7 by position.
+        # The action ids are kept from the old fixed-group scheme so any
+        # keyboard shortcuts users already assigned keep working. Slots past
+        # the number of configured primaries simply do nothing.
+        slot_ids = [
+            "tela_extension_tool_vector", "tela_extension_tool_brush",
+            "tela_extension_tool_transform", "tela_extension_tool_color",
+            "tela_extension_tool_overlay", "tela_extension_tool_select",
+            "tela_extension_tool_camera",
+        ]
+        self.action_tool = list()
+        for i, aid in enumerate( slot_ids ):
+            action = window.createAction( aid, "Tela Primary " + str( i + 1 ), "tools/scripts/tela_menu/toolbox_menu" )
+            action.setCheckable( True )
+            action.triggered.connect( lambda checked = False, s = i: self.Release_Slot( s ) )
+            self.action_tool.append( action )
 
         # Actions Mirror Fix
         action_mirror_fix_left  = window.createAction( "tela_extension_mirror_fix_left",  "Mirror Fix [LEFT]",  "tools/scripts/tela_menu/mirror_fix_menu" )
