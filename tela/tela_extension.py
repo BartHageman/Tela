@@ -32,6 +32,7 @@ from .tela_modulo import (
     Color_Display,
     Color_Panel,
     )
+from .tela_settings import Layout_Settings_Dialog
 
 #endregion
 #region Global Variables
@@ -283,6 +284,9 @@ class Tela_Extension( Extension ):
             default_groups.append( keys )
             for k in keys:
                 self.tool_catalog[k] = group[k]
+        # Keep the literal's grouping around for the settings dialog's
+        # "Restore Defaults".
+        self.default_groups = default_groups
         # Load config, then build runtime structures.
         self.layout = self.Layout_Load( default_groups )
         self.press_time = self.layout["hold_ms"]
@@ -336,6 +340,45 @@ class Tela_Extension( Extension ):
             if toolkey in self.tool[gid]:
                 return gid
         return None
+    def Layout_Settings( self ):
+        # Open the editor; on Save, apply the new layout live.
+        dialog = Layout_Settings_Dialog( self.tool_catalog, self.layout, self.default_groups, self.window.qwindow() )
+        if dialog.exec():
+            self.Layout_Apply( dialog.result_layout() )
+    def Layout_Apply( self, new_layout ):
+        # Persist and rebuild the runtime model + primary buttons in place, so a
+        # layout change takes effect without restarting Krita.
+        self.Menu_Reset()
+        self.layout = new_layout
+        self.Layout_Save( new_layout )
+        self.press_time = new_layout["hold_ms"]
+        self.Layout_Build()
+        self.Primary_Rebuild()
+        self.Style_Theme()
+        self.Style_Icon()
+        self.Tela_Geometry( self.show_option, self.show_extra, self.hide_tela )
+        self.Tool_Update()
+    def Primary_Rebuild( self ):
+        # Destroy the old primary buttons and recreate one per configured group.
+        # These are the only overlay widgets whose count/identity depends on the
+        # layout; everything else loops over self.group_ids dynamically.
+        for gid in list( self.primary.keys() ):
+            button = self.primary[gid]
+            button.hide()
+            button.setParent( None )
+            button.deleteLater()
+        self.primary = dict()
+        parent = self.canvas_widget   # may be None ( no document ); adopted later by Canvas_Changed
+        for gid in self.group_ids:
+            button = QPushButton( "primary_" + gid, parent )
+            self.Interface_Push_Button( button, "primary_" + gid, self.pba, self.pba, True, True, False )
+            button.setIcon( self.tool_catalog[self.index[gid]][2] )
+            button.pressed.connect(  lambda g = gid: self.Hold_Primary( g ) )
+            button.released.connect( lambda g = gid: self.Release_Primary( g ) )
+            self.primary[gid] = button
+            if parent is not None:
+                button.show()
+                button.raise_()
 
     # Warnnings
     def Message_Float( self, operation, message, icon ):
@@ -1155,8 +1198,11 @@ class Tela_Extension( Extension ):
         action_show_extra = self.qmenu.addAction( "Show Extra" )
         action_show_extra.setCheckable( True )
         action_show_extra.setChecked( self.show_extra )
+        # Configure
+        self.qmenu.addSeparator()
+        action_configure = self.qmenu.addAction( "Configure Toolbox..." )
         # Mapping
-        item = 2
+        item = 3
         size = 23  # 23 is the expected height of a self.qmenu item on windows at least
         height = size * item + self.my
         qpoint = widget.geometry().topLeft()
@@ -1166,6 +1212,7 @@ class Tela_Extension( Extension ):
         # State
         if action == action_show_option:    self.Show_Option( not self.show_option )
         if action == action_show_extra:     self.Show_Extra( not self.show_extra )
+        if action == action_configure:      self.Layout_Settings()
         # Clean up
         self.Menu_Down()
 
